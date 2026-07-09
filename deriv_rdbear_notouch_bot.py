@@ -2026,7 +2026,12 @@ def entropy_gate_passes(prices, threshold=PE_THRESHOLD):
 # simultaneously; an edge visible only on raw noisy ticks is far more likely
 # to be spurious. Returns the count of timeframes agreeing with the proposed
 # direction (0-3) plus the per-TF directions for logging/diagnostics.
-MIN_TF_AGREEMENT = 2   # require at least 2 of 3 timeframes to agree
+#
+# RDBEAR build: lowered 2 -> 1. Only one of the three timeframes needs to
+# support the primary signal's direction for that direction to stand; the
+# timeframe-majority fallback below only kicks in when NONE of the three
+# support it.
+MIN_TF_AGREEMENT = 1   # require at least 1 of 3 timeframes to agree
 
 def _bar_returns(prices, bar_size):
     """Aggregate raw prices into bar_size-tick OHLC-style closes, return log-diffs."""
@@ -2072,22 +2077,26 @@ def multi_timeframe_confluence(prices, proposed_direction):
 
 def resolve_notouch_direction(prices, proposed_direction):
     """
-    RDBEAR-only build: replaces the old hard confluence GATE (skip trade
-    unless >=2/3 timeframes agree with the primary signal) with a direction
-    RESOLVER. NOTOUCH only needs *a* side to place its single barrier on —
-    it doesn't need directional conviction the way CALL/PUT does — so instead
-    of blocking the trade when timeframes disagree with the primary signal,
-    this picks whichever direction the timeframes actually lean toward
-    (majority vote of tf1/tf5/tf20), falling back to the primary signal on a
-    tie or all-neutral read. Always returns a usable direction; never skips.
+    RDBEAR-only build: all three timeframes (tf1/tf5/tf20) are still computed
+    for visibility, but the bar to KEEP the primary signal's direction is
+    just MIN_TF_AGREEMENT=1 — as soon as one timeframe supports it, that
+    direction stands, full stop. Only when tf_agree == 0 (literally none of
+    the three support the primary signal) does it fall back to whichever
+    direction the timeframes actually lean toward (majority vote of
+    tf1/tf5/tf20, or the primary signal itself on a tie/all-neutral read).
+    Never skips the trade either way — NOTOUCH just needs a side to place
+    its barrier on.
 
     Returns (final_direction: +1/-1, tf_agree: int 0-3, tf_dirs: dict,
              overridden: bool) — overridden=True if the resolved direction
     differs from the primary fuse_signal direction, for logging/visibility.
     """
     tf_agree, tf_dirs = multi_timeframe_confluence(prices, proposed_direction)
-    votes = [d for d in tf_dirs.values() if d != 0]
 
+    if tf_agree >= MIN_TF_AGREEMENT:
+        return proposed_direction, tf_agree, tf_dirs, False
+
+    votes = [d for d in tf_dirs.values() if d != 0]
     if not votes:
         return proposed_direction, tf_agree, tf_dirs, False
 
