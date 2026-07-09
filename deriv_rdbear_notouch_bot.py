@@ -270,8 +270,19 @@ GATE_SCHEMA_VERSION = 4
 # gate. At 9/4, 38% pass — and the entropy gate + confluence then do the
 # real quality filtering on that larger pool. The quality throttle is the
 # combination of ALL gates, not this one gate alone.
-MIN_LAYER_AGREE    = 9
-MAX_LAYER_DISAGREE = 4
+#
+# RDBEAR-only build: relaxed from 9/4 -> 7/6. These were originally tuned on
+# a trending multi-symbol universe where 9+ layer agreement was achievable.
+# RDBEAR is deliberately mean-reverting/non-directional (Hurst ~0.05,
+# ~51% directional hit rate) — that's WHY it's traded via NOTOUCH instead of
+# CALL/PUT. Overnight logs showed the bot skipping essentially every cycle
+# because it could rarely muster 9+ agree on a symbol with no real
+# directional edge, even though the barrier side only needs a lean, not
+# strong conviction, to place a NOTOUCH barrier. 7/6 keeps this a real gate
+# (not a rubber stamp) while no longer requiring near-unanimous consensus
+# from an instrument that structurally won't produce it.
+MIN_LAYER_AGREE    = 7
+MAX_LAYER_DISAGREE = 6
 
 # FIX v2: Hard cap on total stake committed in one martingale sequence.
 # If the cumulative at-risk amount would exceed this fraction of balance,
@@ -2059,6 +2070,40 @@ def multi_timeframe_confluence(prices, proposed_direction):
     return agreement, {"tf1": d1, "tf5": d5, "tf20": d20}
 
 
+def resolve_notouch_direction(prices, proposed_direction):
+    """
+    RDBEAR-only build: replaces the old hard confluence GATE (skip trade
+    unless >=2/3 timeframes agree with the primary signal) with a direction
+    RESOLVER. NOTOUCH only needs *a* side to place its single barrier on —
+    it doesn't need directional conviction the way CALL/PUT does — so instead
+    of blocking the trade when timeframes disagree with the primary signal,
+    this picks whichever direction the timeframes actually lean toward
+    (majority vote of tf1/tf5/tf20), falling back to the primary signal on a
+    tie or all-neutral read. Always returns a usable direction; never skips.
+
+    Returns (final_direction: +1/-1, tf_agree: int 0-3, tf_dirs: dict,
+             overridden: bool) — overridden=True if the resolved direction
+    differs from the primary fuse_signal direction, for logging/visibility.
+    """
+    tf_agree, tf_dirs = multi_timeframe_confluence(prices, proposed_direction)
+    votes = [d for d in tf_dirs.values() if d != 0]
+
+    if not votes:
+        return proposed_direction, tf_agree, tf_dirs, False
+
+    up_votes   = sum(1 for d in votes if d > 0)
+    down_votes = sum(1 for d in votes if d < 0)
+
+    if up_votes > down_votes:
+        final = 1
+    elif down_votes > up_votes:
+        final = -1
+    else:
+        final = proposed_direction   # tie — keep the primary signal's lean
+
+    return final, tf_agree, tf_dirs, (final != proposed_direction)
+
+
 # ---------------------------------------------------------------------------
 # LAYER 9: KALMAN FILTER (real 2-state local-level + trend filter)
 # ---------------------------------------------------------------------------
@@ -3387,14 +3432,15 @@ def passes_layer_gate(feats, direction):
         disagree = feats["agree_up"]
     neutral = feats["n_neutral"]
 
-    # Regime-conditional thresholds
+    # Regime-conditional thresholds (shifted with the 7/6 RDBEAR baseline —
+    # same relative widening/tightening behavior as the original 9/4 tuning)
     rs = float(feats.get("regime_strength", 0.0))
     if rs > 0.4:        # strong trending — signals cheap, raise bar
-        min_agree = min(MIN_LAYER_AGREE + 2, 13)
-        max_dis   = max(MAX_LAYER_DISAGREE - 1, 1)
+        min_agree = min(MIN_LAYER_AGREE + 2, 11)
+        max_dis   = max(MAX_LAYER_DISAGREE - 1, 3)
     elif rs < -0.2:     # ranging/noisy — signals rare, relax bar
-        min_agree = max(MIN_LAYER_AGREE - 1, 7)
-        max_dis   = min(MAX_LAYER_DISAGREE + 1, 6)
+        min_agree = max(MIN_LAYER_AGREE - 1, 5)
+        max_dis   = min(MAX_LAYER_DISAGREE + 1, 8)
     else:               # neutral regime — use configured defaults
         min_agree = MIN_LAYER_AGREE
         max_dis   = MAX_LAYER_DISAGREE
@@ -4756,11 +4802,17 @@ async def main():
                 vlog(f"[EntropyGate] {s} skipped — PE={pe_score:.3f} >= {PE_THRESHOLD}")
                 continue
 
-            # Gate 3: Multi-timeframe confluence
-            tf_agree, tf_dirs = multi_timeframe_confluence(sd.prices(), direction)
-            if tf_agree < MIN_TF_AGREEMENT:
-                vlog(f"[Confluence] {s} skipped — only {tf_agree}/3 TFs agree {tf_dirs}")
-                continue
+            # Gate 3 (RDBEAR build): timeframe confluence RESOLVES the barrier
+            # side instead of gating on it. NOTOUCH only needs a side to lean
+            # the barrier toward, not directional conviction — so if the
+            # timeframes disagree with the primary signal, we follow the
+            # timeframes' majority vote rather than skipping the trade.
+            direction, tf_agree, tf_dirs, overridden = resolve_notouch_direction(
+                sd.prices(), direction
+            )
+            if overridden:
+                vlog(f"[Confluence] {s} — direction overridden by TF majority "
+                     f"{tf_dirs} -> {direction} ({tf_agree}/3 agreed with original)")
 
             # MC No Touch scan — fast (no network), narrows to top candidates
             nt_candidates = mc_notouch_scan(
