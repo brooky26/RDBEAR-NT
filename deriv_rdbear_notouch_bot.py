@@ -1973,7 +1973,7 @@ def sample_entropy_trust(returns, m=2, r_mult=0.2):
 # down-weighted. Permutation entropy (Bandt-Pompe) measures the predictability
 # of ordinal patterns in a short window of recent prices.
 PE_EMBED_DIM     = 5
-PE_THRESHOLD     = 0.85   # FIX v3: raised 0.82 → 0.85 based on live log analysis.
+PE_THRESHOLD     = 0.89   # FIX v3: raised 0.82 → 0.85 based on live log analysis.
                            # R_50 was producing PE=0.824-0.847 on every scan,
                            # generating 331 entropy skips — nearly double the
                            # layer-gate skips (161). This is not genuine market
