@@ -1,11 +1,27 @@
 """
-Deriv Multi-Symbol Rise/Fall Trading Bot - FULL POWER  v3
+Deriv Multi-Symbol Rise/Fall Trading Bot - FULL POWER  v4
 ==========================================================
 Single-file bot. Scans all eligible synthetic-index symbols, runs an
 18-layer intelligence pipeline per symbol using fitted statistical models,
 fuses evidence via a meta-learner with Bayesian fallback, auto-selects trade
 duration via Monte Carlo simulation, and allocates capital across symbols
 by edge × confidence × correlation adjustment.
+
+v4 CHANGE (2026-07-09) — MULTI-SYMBOL RISE/FALL, DIRECTION-RESTRICTED RDBEAR:
+  Trading universe is now R_75, R_100, and RDBEAR, all trading Rise/Fall
+  (CALL/PUT) instead of the v3 RDBEAR-only NOTOUCH build. R_75 and R_100
+  trade either direction; RDBEAR trades Fall (PUT) only — a signal that
+  resolves to CALL on RDBEAR is skipped that cycle rather than forced or
+  flipped (see ALLOWED_DIRECTIONS). Duration is not fixed: monte_carlo_
+  duration() auto-selects whichever of CANDIDATE_DURATIONS maximises
+  blended (simulation + empirical) win probability, per symbol, per cycle.
+  deep_startup_calibration() runs across all three symbols before the bot
+  places any trade, giving each its own walk-forward-fitted models, per-
+  duration empirical win rates, per-symbol confidence threshold, and
+  reliability score before live trading begins. The NOTOUCH scan/quote/
+  execution path (mc_notouch_scan, select_best_notouch, verify_rdbear_
+  notouch) is left in place but unused, in case a NOTOUCH-mode symbol is
+  reintroduced later.
 
 v3 UPGRADES (2026-07-01):
 ─────────────────────────────────────────────────────────────────
@@ -271,18 +287,16 @@ GATE_SCHEMA_VERSION = 4
 # real quality filtering on that larger pool. The quality throttle is the
 # combination of ALL gates, not this one gate alone.
 #
-# RDBEAR-only build: relaxed from 9/4 -> 7/6. These were originally tuned on
-# a trending multi-symbol universe where 9+ layer agreement was achievable.
-# RDBEAR is deliberately mean-reverting/non-directional (Hurst ~0.05,
-# ~51% directional hit rate) — that's WHY it's traded via NOTOUCH instead of
-# CALL/PUT. Overnight logs showed the bot skipping essentially every cycle
-# because it could rarely muster 9+ agree on a symbol with no real
-# directional edge, even though the barrier side only needs a lean, not
-# strong conviction, to place a NOTOUCH barrier. 7/6 keeps this a real gate
-# (not a rubber stamp) while no longer requiring near-unanimous consensus
-# from an instrument that structurally won't produce it.
-MIN_LAYER_AGREE    = 7
-MAX_LAYER_DISAGREE = 6
+# v4 multi-symbol build: 8/5. R_75/R_100 are trending-capable and can
+# usually clear a stricter bar (originally tuned at 9/4 on a trending
+# universe); RDBEAR is deliberately mean-reverting/non-directional
+# (Hurst ~0.05) and needs the softer end. 8/5 is a single global compromise
+# — per-symbol confidence thresholds (state.per_symbol_threshold, set during
+# deep_startup_calibration) do the finer-grained per-symbol calibration on
+# top of this shared layer-count gate, and autotune_gates() nudges these
+# two numbers over time from live results.
+MIN_LAYER_AGREE    = 8
+MAX_LAYER_DISAGREE = 5
 
 # FIX v2: Hard cap on total stake committed in one martingale sequence.
 # If the cumulative at-risk amount would exceed this fraction of balance,
@@ -322,7 +336,26 @@ POST_LOSS_DEEP_RECAL = False
 CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]
 
 # =============================================================================
-# NO TOUCH CONTRACT CONFIGURATION  (RDBEAR-only build)
+# v4 — MULTI-SYMBOL RISE/FALL BUILD
+# =============================================================================
+# Trading universe: R_75 and R_100 trade Rise/Fall in either direction
+# (CALL or PUT, whichever the fused signal + timeframe confluence resolves
+# to). RDBEAR trades Rise/Fall PUT ("Fall") only — a CALL-resolved signal on
+# RDBEAR is skipped rather than forced or flipped. Duration is not fixed:
+# monte_carlo_duration() picks whichever candidate duration in
+# CANDIDATE_DURATIONS maximises blended (simulation + empirical) win
+# probability for the resolved direction, per symbol, per cycle.
+TRADE_SYMBOLS = ["R_75", "R_100", "RDBEAR"]
+
+ALLOWED_DIRECTIONS = {
+    "R_75":   (1, -1),   # Rise/Fall, either direction
+    "R_100":  (1, -1),   # Rise/Fall, either direction
+    "RDBEAR": (-1,),     # Fall (PUT) only
+}
+
+# =============================================================================
+# NO TOUCH CONTRACT CONFIGURATION  (legacy — unused in the v4 Rise/Fall
+# multi-symbol build below; kept in case a NOTOUCH-mode symbol is added back)
 # =============================================================================
 # Duration range: 2-60 minutes ONLY (sub-minute tick durations removed).
 # Grid matches the empirical RDBEAR NOTOUCH scan durations
@@ -1054,6 +1087,45 @@ async def verify_rdbear_notouch(client, symbol=RDBEAR_SYMBOL):
 
     print(f"[verify_rdbear_notouch] {symbol} verified NOTOUCH-eligible and open")
     return True
+
+
+async def verify_symbols_callput(client, symbols):
+    """v4 multi-symbol build: verifies each symbol in `symbols` is open and
+    CALL/PUT-eligible via contracts_for. Returns the subset that verified
+    (order preserved), logging any symbol that fails or isn't tradable
+    right now rather than raising."""
+    resp = await client.send({"active_symbols": "brief"})
+    if "error" in resp:
+        print(f"[verify_symbols_callput] active_symbols error: {resp['error']}")
+        return []
+    open_symbols = {
+        s.get("underlying_symbol") for s in resp.get("active_symbols", [])
+        if s.get("exchange_is_open", 1)
+    }
+
+    verified = []
+    for symbol in symbols:
+        if symbol not in open_symbols:
+            print(f"[verify_symbols_callput] {symbol} not found or market closed")
+            continue
+        try:
+            cf = await client.send({"contracts_for": symbol})
+            if "error" in cf:
+                print(f"[verify_symbols_callput] {symbol} contracts_for error: {cf['error']}")
+                continue
+            types = {c["contract_type"] for c in cf.get("contracts_for", {}).get("available", [])}
+            if "CALL" in types and "PUT" in types:
+                verified.append(symbol)
+                print(f"[verify_symbols_callput] {symbol} verified CALL/PUT-eligible and open")
+            else:
+                print(f"[verify_symbols_callput] {symbol} does not offer CALL/PUT "
+                      f"(available: {sorted(types)})")
+        except Exception as e:
+            print(f"[verify_symbols_callput] {symbol} contracts_for check failed: "
+                  f"{type(e).__name__}: {e}")
+        await asyncio.sleep(0.05)
+
+    return verified
 
 
 async def select_top_1hz(client, n_top=3):
@@ -1973,7 +2045,7 @@ def sample_entropy_trust(returns, m=2, r_mult=0.2):
 # down-weighted. Permutation entropy (Bandt-Pompe) measures the predictability
 # of ordinal patterns in a short window of recent prices.
 PE_EMBED_DIM     = 5
-PE_THRESHOLD     = 0.89   # FIX v3: raised 0.82 → 0.85 based on live log analysis.
+PE_THRESHOLD     = 0.85   # FIX v3: raised 0.82 → 0.85 based on live log analysis.
                            # R_50 was producing PE=0.824-0.847 on every scan,
                            # generating 331 entropy skips — nearly double the
                            # layer-gate skips (161). This is not genuine market
@@ -2077,15 +2149,16 @@ def multi_timeframe_confluence(prices, proposed_direction):
 
 def resolve_notouch_direction(prices, proposed_direction):
     """
-    RDBEAR-only build: all three timeframes (tf1/tf5/tf20) are still computed
-    for visibility, but the bar to KEEP the primary signal's direction is
-    just MIN_TF_AGREEMENT=1 — as soon as one timeframe supports it, that
+    All three timeframes (tf1/tf5/tf20) are always computed for visibility,
+    but the bar to KEEP the primary signal's direction is just
+    MIN_TF_AGREEMENT=1 — as soon as one timeframe supports it, that
     direction stands, full stop. Only when tf_agree == 0 (literally none of
     the three support the primary signal) does it fall back to whichever
     direction the timeframes actually lean toward (majority vote of
     tf1/tf5/tf20, or the primary signal itself on a tie/all-neutral read).
-    Never skips the trade either way — NOTOUCH just needs a side to place
-    its barrier on.
+    This never skips the trade by itself — it only resolves which side
+    (CALL/PUT) to take. The v4 build applies ALLOWED_DIRECTIONS as a
+    separate filter immediately after this call (e.g. RDBEAR = Fall only).
 
     Returns (final_direction: +1/-1, tf_agree: int 0-3, tf_dirs: dict,
              overridden: bool) — overridden=True if the resolved direction
@@ -4513,25 +4586,33 @@ async def main():
               f"disagree<={MAX_LAYER_DISAGREE} MC>={MIN_EXP_WIN_RATE:.2f} "
               f"thr={state.adaptive_threshold:.4f}")
 
-    # --- RDBEAR-only build: single symbol, no R_/1HZ universe scan ---
-    verified = False
+    # --- v4 multi-symbol build: R_75 + R_100 (Rise/Fall, either direction),
+    #     RDBEAR (Rise/Fall, PUT/Fall only — see ALLOWED_DIRECTIONS) ---
+    verified_symbols = []
     for attempt in range(1, 6):
-        verified = await verify_rdbear_notouch(client)
-        if verified:
+        verified_symbols = await verify_symbols_callput(client, TRADE_SYMBOLS)
+        if len(verified_symbols) == len(TRADE_SYMBOLS):
             break
-        print(f"[main] RDBEAR not NOTOUCH-eligible on attempt {attempt}/5, retrying in 3s...")
+        print(f"[main] {len(verified_symbols)}/{len(TRADE_SYMBOLS)} symbols verified "
+              f"on attempt {attempt}/5, retrying in 3s...")
         await asyncio.sleep(3)
-    if not verified:
+    if not verified_symbols:
         raise RuntimeError(
-            "RDBEAR is not NOTOUCH-eligible or not open (check API credentials/"
-            "connectivity/market hours)."
+            "None of R_75/R_100/RDBEAR are CALL/PUT-eligible or open right now "
+            "(check API credentials/connectivity/market hours)."
         )
+    if len(verified_symbols) < len(TRADE_SYMBOLS):
+        missing = [s for s in TRADE_SYMBOLS if s not in verified_symbols]
+        print(f"[main] WARNING: proceeding without {missing} — not verified as "
+              f"CALL/PUT-eligible/open. Will retry them on the next restart.")
 
-    symbols = [RDBEAR_SYMBOL]
-    print(f"\nTrading universe (RDBEAR-only build): {symbols}")
+    symbols = verified_symbols
+    print(f"\nTrading universe: {symbols}")
+    print(f"Allowed directions: { {s: ALLOWED_DIRECTIONS.get(s, (1, -1)) for s in symbols} }")
 
-    # tick rate confirmed ~0.5 ticks/sec (~2s/tick) from live RDBEAR scan logs
-    symbol_data = {RDBEAR_SYMBOL: SymbolData(RDBEAR_SYMBOL, tick_dt=2.0)}
+    # R_ symbols tick at ~2s/tick (confirmed from live RDBEAR scan logs);
+    # applies equally to R_75/R_100.
+    symbol_data = {s: SymbolData(s, tick_dt=2.0) for s in symbols}
 
     print(f"Bootstrapping tick history for all symbols (target: {HISTORY_BOOTSTRAP_COUNT} ticks each)...")
     for s in symbols:
@@ -4651,14 +4732,21 @@ async def main():
                     continue
                 p_up, confidence = fuse_signal(feats, state, s)
                 direction = 1 if p_up > 0.5 else -1
-                # Recovery uses a relaxed layer gate (8/5 vs 10/3 for step-0).
-                # We just need the best available directional signal to close
-                # the open sequence — not the same high bar as a fresh entry.
-                n_layers     = feats.get('n_layers', 17)
+                # Recovery uses a relaxed layer gate (8/5 vs the stricter
+                # step-0 bar). We just need the best available directional
+                # signal to close the open sequence, not the same high bar
+                # as a fresh entry.
                 n_agree_s    = feats.get('agree_up' if direction == 1 else 'agree_down', 0)
                 n_disagree_s = feats.get('agree_down' if direction == 1 else 'agree_up', 0)
                 if n_agree_s < 8 or n_disagree_s > 5:
                     continue
+
+                # Confluence can still refine the direction before the
+                # per-symbol direction filter (e.g. RDBEAR = Fall only) applies.
+                direction, _, _, _ = resolve_notouch_direction(sd.prices(), direction)
+                if direction not in ALLOWED_DIRECTIONS.get(s, (1, -1)):
+                    continue
+
                 duration_s, exp_win = monte_carlo_duration(
                     sd.prices(), sd.returns(), direction, feats, CANDIDATE_DURATIONS,
                     models=state.model_cache.get(s)
@@ -4677,36 +4765,18 @@ async def main():
 
             # Pick the strongest
             rec_candidates.sort(reverse=True)
-            _, rec_sym, rec_dir, rec_p_up, rec_conf, duration, exp_win_rate, feats, n_agree = rec_candidates[0]
-            rec_score = rec_conf * state.reliability.get(rec_sym, 1.0)
-
-            # Recovery also uses No Touch — run a quick MC scan on the
-            # selected recovery symbol to get the best barrier/duration.
-            sd_rec = symbol_data[rec_sym]
-            rec_nt_cands = mc_notouch_scan(
-                sd_rec.prices(), sd_rec.returns(), feats, rec_dir, sd=sd_rec
-            )
-            rec_nt_entry = await select_best_notouch(
-                client, rec_sym, rec_nt_cands, rec_dir
-            )
-            if rec_nt_entry is None:
-                vlog(f"[Recovery] {rec_sym} — no NT entry found, skipping cycle")
-                await asyncio.sleep(2)
-                continue
+            _, rec_sym, rec_dir, rec_p_up, rec_conf, rec_duration, exp_win_rate, feats, n_agree = rec_candidates[0]
 
             print(f"[Recovery] step={state.recovery_step} | {rec_sym} "
-                  f"{'NOTOUCH BELOW' if rec_dir > 0 else 'NOTOUCH ABOVE'} | "
-                  f"barrier={rec_nt_entry['barrier_rel']} | "
-                  f"dur={rec_nt_entry['dur_val']}{rec_nt_entry['dur_unit']} | "
-                  f"P={rec_nt_entry['p_no_touch']:.3f} | EV={rec_nt_entry['ev']:+.3f} | "
+                  f"{'CALL (Rise)' if rec_dir > 0 else 'PUT (Fall)'} | "
+                  f"dur={rec_duration}t | P(win)={exp_win_rate:.3f} | "
                   f"stake={state.recovery_stake:.2f}")
 
             won, _ = await execute_single_step(
                 client, state, rec_sym, rec_dir,
                 state.recovery_stake, state.recovery_step,
-                duration=rec_nt_entry["dur_val"],
+                duration=rec_duration,
                 feats=feats,
-                notouch_entry=rec_nt_entry,
             )
 
             if won:
@@ -4811,11 +4881,10 @@ async def main():
                 vlog(f"[EntropyGate] {s} skipped — PE={pe_score:.3f} >= {PE_THRESHOLD}")
                 continue
 
-            # Gate 3 (RDBEAR build): timeframe confluence RESOLVES the barrier
-            # side instead of gating on it. NOTOUCH only needs a side to lean
-            # the barrier toward, not directional conviction — so if the
-            # timeframes disagree with the primary signal, we follow the
-            # timeframes' majority vote rather than skipping the trade.
+            # Gate 3: timeframe confluence REFINES the direction rather than
+            # gating on it — if the timeframes disagree with the primary
+            # signal, we follow the timeframes' majority vote instead of
+            # skipping the trade outright.
             direction, tf_agree, tf_dirs, overridden = resolve_notouch_direction(
                 sd.prices(), direction
             )
@@ -4823,58 +4892,42 @@ async def main():
                 vlog(f"[Confluence] {s} — direction overridden by TF majority "
                      f"{tf_dirs} -> {direction} ({tf_agree}/3 agreed with original)")
 
-            # MC No Touch scan — fast (no network), narrows to top candidates
-            nt_candidates = mc_notouch_scan(
-                sd.prices(), live_returns, feats, direction, sd=sd
-            )
-            if not nt_candidates:
-                vlog(f"[NT-MC] {s} — no candidates in P range {NOTOUCH_MIN_P}-{NOTOUCH_MAX_P}")
+            # Gate 4: per-symbol allowed direction. R_75/R_100 trade either
+            # direction; RDBEAR trades Fall (PUT) only — a resolved CALL on
+            # RDBEAR is skipped this cycle rather than forced or flipped.
+            if direction not in ALLOWED_DIRECTIONS.get(s, (1, -1)):
+                vlog(f"[DirectionFilter] {s} skipped — direction {direction} not "
+                     f"in allowed set {ALLOWED_DIRECTIONS.get(s)} for this symbol")
                 continue
 
-            # Store candidates for parallel payout query below
+            # MC duration scan — auto-selects whichever candidate duration
+            # (CANDIDATE_DURATIONS) maximises blended simulation + empirical
+            # win probability for the resolved direction on this symbol.
+            duration, exp_win = monte_carlo_duration(
+                sd.prices(), live_returns, direction, feats, CANDIDATE_DURATIONS,
+                models=state.model_cache.get(s)
+            )
+            if exp_win < MIN_EXP_WIN_RATE:
+                vlog(f"[MC] {s} skipped — best duration={duration}t "
+                     f"exp_win={exp_win:.3f} < floor {MIN_EXP_WIN_RATE}")
+                continue
+
             portfolio_candidates.append((
                 s, direction, float(p_up), float(confidence),
-                n_agree, nt_candidates, feats
+                n_agree, duration, exp_win, feats
             ))
 
         if not portfolio_candidates:
             continue
 
-        # ── Parallel payout queries for all passing symbols ────────────────
-        # Query Deriv simultaneously rather than sequentially — keeps the
-        # scan cycle fast enough to maintain 10-20 trades/hour target.
-        async def _query_symbol(entry):
-            s, direction, p_up, conf, n_agree, cands, feats = entry
-            best = await select_best_notouch(client, s, cands, direction)
-            if best is None:
-                return None
-            return (s, direction, float(p_up), float(conf),
-                    float(best["p_no_touch"]), best, feats, n_agree)
-
-        query_tasks = [_query_symbol(e) for e in portfolio_candidates]
-        query_results = await asyncio.gather(*query_tasks, return_exceptions=True)
-
-        # Filter out None / exceptions — keep only entries with a valid NT entry
-        notouch_candidates = [
-            r for r in query_results
-            if r is not None and not isinstance(r, Exception)
-        ]
-
-        if not notouch_candidates:
-            continue
-
-        # Sort by EV descending
-        notouch_candidates.sort(
-            key=lambda x: x[5]["ev"] * state.reliability.get(x[0], 1.0),
-            reverse=True
-        )
-
-        # ── No Touch portfolio allocation ──────────────────────────────────
-        # Build PortfolioAllocator-compatible candidate list using NT EV
-        # as the signal quality proxy (replaces exp_win_rate from Rise/Fall)
+        # ── Rise/Fall portfolio allocation ──────────────────────────────────
+        # PortfolioAllocator candidate tuple: (symbol, direction, p_up_cal,
+        # confidence, exp_win, duration) — exp_win from monte_carlo_duration
+        # is the signal-quality proxy it uses for Kelly sizing.
         alloc_input = [
-            (s, direction, p_up, conf, nt_entry["p_no_touch"], 0)
-            for s, direction, p_up, conf, _, nt_entry, _, _ in notouch_candidates
+            (s, direction, p_up, conf, exp_win, duration)
+            for s, direction, p_up, conf, _n_agree, duration, exp_win, _feats
+            in portfolio_candidates
         ]
         allocations = PortfolioAllocator.allocate(
             alloc_input, state, symbol_data, state.balance
@@ -4883,25 +4936,21 @@ async def main():
             continue
 
         # Execute each allocation
-        for symbol, direction, base_stake, _dur_unused in allocations:
-            # Retrieve the No Touch entry for this symbol
-            nt_row = next(
-                (r for r in notouch_candidates if r[0] == symbol), None
+        for symbol, direction, base_stake, duration in allocations:
+            cand_row = next(
+                (c for c in portfolio_candidates if c[0] == symbol), None
             )
-            if nt_row is None:
+            if cand_row is None:
                 continue
-            _, _, p_up_sym, conf_sym, _, nt_entry, feats_sym, _ = nt_row
-            score_sym = conf_sym * state.reliability.get(symbol, 1.0)
+            _, _, p_up_sym, conf_sym, _, dur_sym, exp_win_sym, feats_sym = cand_row
 
             reset_sequence_accumulator(state, state.balance, p_up_sym, conf_sym,
-                                        nt_entry["dur_val"])
+                                        dur_sym)
             state.last_step0_time = time.time()
 
             print(f"TRADE SIGNAL | {symbol} "
-                  f"{'NOTOUCH BELOW' if direction > 0 else 'NOTOUCH ABOVE'} | "
-                  f"barrier={nt_entry['barrier_rel']} | "
-                  f"dur={nt_entry['dur_val']}{nt_entry['dur_unit']} | "
-                  f"P={nt_entry['p_no_touch']:.3f} | EV={nt_entry['ev']:+.3f} | "
+                  f"{'CALL (Rise)' if direction > 0 else 'PUT (Fall)'} | "
+                  f"dur={dur_sym}t | P(win)={exp_win_sym:.3f} | "
                   f"stake={base_stake:.2f}")
 
             state.open_positions[symbol] = {
@@ -4912,9 +4961,8 @@ async def main():
 
             won, _ = await execute_single_step(
                 client, state, symbol, direction, base_stake, 0,
-                duration=nt_entry["dur_val"],
+                duration=dur_sym,
                 feats=feats_sym,
-                notouch_entry=nt_entry,
             )
 
             # Remove from open positions after resolution
